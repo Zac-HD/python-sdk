@@ -61,11 +61,18 @@ class ContextSendStream(Generic[T]):
 class ContextReceiveStream(Generic[T]):
     """Receive-side wrapper that yields ``T`` and stores the sender's context in ``last_context``."""
 
-    __slots__ = ("_inner", "last_context")
+    __slots__ = ("_inner", "last_context", "eof_is_half_close")
 
-    def __init__(self, inner: MemoryObjectReceiveStream[_Envelope[T]]) -> None:
+    def __init__(self, inner: MemoryObjectReceiveStream[_Envelope[T]], *, eof_is_half_close: bool = False) -> None:
         self._inner = inner
         self.last_context: contextvars.Context | None = None
+        self.eof_is_half_close = eof_is_half_close
+        """Whether this stream ending means the peer stopped sending but still reads what we send.
+
+        A transport sets it for a half-close (stdio: the client closes our stdin, then drains
+        our stdout), so a consumer finishes the work it already dequeued and answers it. False
+        means EOF is a full disconnect, so pending work has no one to answer.
+        """
 
     async def receive(self) -> T:
         ctx, item = await self._inner.receive()
@@ -112,8 +119,10 @@ class create_context_streams(
     matching anyio's ``create_memory_object_stream`` API style.
     """
 
-    def __new__(cls, max_buffer_size: float = 0) -> tuple[ContextSendStream[T], ContextReceiveStream[T]]:  # type: ignore[type-var]
+    def __new__(  # type: ignore[type-var]
+        cls, max_buffer_size: float = 0, *, eof_is_half_close: bool = False
+    ) -> tuple[ContextSendStream[T], ContextReceiveStream[T]]:
         raw_send: MemoryObjectSendStream[Any]
         raw_receive: MemoryObjectReceiveStream[Any]
         raw_send, raw_receive = anyio.create_memory_object_stream(max_buffer_size)
-        return (ContextSendStream(raw_send), ContextReceiveStream(raw_receive))
+        return (ContextSendStream(raw_send), ContextReceiveStream(raw_receive, eof_is_half_close=eof_is_half_close))

@@ -273,6 +273,7 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
         raise_handler_exceptions: bool = False,
         inline_methods: frozenset[str] = frozenset(),
         on_stream_exception: Callable[[Exception], Awaitable[None]] | None = None,
+        drain_on_eof: bool = False,
     ) -> None:
         """Wire a dispatcher over a transport's `SessionMessage` stream pair.
 
@@ -287,6 +288,14 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
             on_stream_exception: Observer for `Exception` items on the read
                 stream; without it they are debug-logged and dropped. Awaited
                 inline in the read loop, so a slow observer stalls dispatch.
+            drain_on_eof: Treat a clean read-stream EOF as a half-close: the
+                peer stopped sending but still reads (stdio: the client closes
+                our stdin, then reads our stdout to the end), so in-flight
+                handlers run to completion and their answers are written before
+                `run()` returns. Off (the default), EOF cancels them: on a full
+                disconnect nobody would read the answers. A handler that never
+                returns then holds `run()` open; bounding that is the caller's
+                job. Never applies to `run()` being cancelled or crashing.
         """
         self._read_stream = read_stream
         self._write_stream = write_stream
@@ -299,6 +308,7 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
         self._peer_cancel_mode: PeerCancelMode = peer_cancel_mode
         self._raise_handler_exceptions = raise_handler_exceptions
         self._inline_methods = inline_methods
+        self._drain_on_eof = drain_on_eof
         self.on_stream_exception = on_stream_exception
         """Observer for ``Exception`` items on the read stream. Mutable so a session can
         bind it after the dispatcher is built (e.g. ``ClientSession`` routing into
@@ -311,6 +321,7 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
         self._tg: anyio.abc.TaskGroup | None = None
         self._running = False
         self._closed = False
+        self._draining = False
 
     async def send_raw_request(
         self,
@@ -458,7 +469,9 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
         torn-down transport drops the notification with a debug log instead
         of raising (same policy as the response writes and `ctx.notify`).
         """
-        if self._closed:
+        # A draining dispatcher is closed for requests (nothing can answer them) but
+        # its peer still reads, so notifications from in-flight handlers go out.
+        if self._closed and not self._draining:
             logger.debug("dropped %s: dispatcher closed", method)
             return
         # Leave `params` unset when None: with `exclude_unset=True` an explicit
@@ -511,7 +524,16 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
                         self._running = False
                         self._closed = True
                         self._fan_out_closed()
-                    finally:
+                    except BaseException:
+                        # Crash or cancel: the in-flight handlers' callers are gone too.
+                        tg.cancel_scope.cancel()
+                        raise
+                    if self._drain_on_eof:
+                        # Half-close: the peer stopped sending but still reads, so the
+                        # join lets in-flight handlers answer. The fan-out above already
+                        # woke any that were waiting on the peer.
+                        self._draining = True
+                    else:
                         # Cancel in-flight handlers; otherwise the task-group join
                         # waits on handlers whose callers are already gone.
                         tg.cancel_scope.cancel()
@@ -519,6 +541,7 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
             # Covers cancel/crash paths that skip the inline fan-out; idempotent.
             self._running = False
             self._closed = True
+            self._draining = False
             self._tg = None
             self._fan_out_closed()
             await resync_tracer()

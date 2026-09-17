@@ -11,6 +11,8 @@ Example:
     ```
 """
 
+import concurrent.futures
+import logging
 import os
 import sys
 import threading
@@ -21,12 +23,15 @@ from io import TextIOWrapper
 from typing import BinaryIO, Literal, TextIO
 
 import anyio
+import anyio.from_thread
 import anyio.lowlevel
 import mcp_types as types
 
 from mcp.os.win32.utilities import rebind_std_handle_to_fd
 from mcp.shared._context_streams import create_context_streams
 from mcp.shared.message import SessionMessage
+
+logger = logging.getLogger(__name__)
 
 if sys.platform != "win32":  # pragma: no branch
     import fcntl  # pragma: lax no cover - POSIX-only line, uncovered on Windows runners
@@ -166,6 +171,14 @@ async def stdio_server(stdin: anyio.AsyncFile[str] | None = None, stdout: anyio.
     and children read EOF and their stray output misses the wire; both descriptors
     are restored on exit. Explicit streams skip the claim, and a second concurrent
     stdio_server() raises RuntimeError.
+
+    EOF on stdin is a half-close (spec lifecycle: closing it is how the client asks
+    the server to stop, and it keeps reading stdout meanwhile), so the read stream is
+    marked `eof_is_half_close` and the server loop answers every request it has
+    already read before it returns. Bounding that is the caller's job: the client
+    is the one that decides how long to wait before killing the process. A client
+    that closes our stdout instead has stopped reading, so the server stops at once,
+    in-flight requests included, and the block exits normally.
     """
     # Re-wrap the binary buffers as UTF-8 text; the std handles' platform encodings are unreliable.
     restore_stdin: Callable[[], None] | None = None
@@ -178,23 +191,40 @@ async def stdio_server(stdin: anyio.AsyncFile[str] | None = None, stdout: anyio.
             stdout_buffer, restore_stdout = _claim_fd(1, sys.stdout, "wb", _open_stdout_diversion)
             stdout = anyio.wrap_file(_UnownedTextWrapper(stdout_buffer, encoding="utf-8"))
 
-        read_stream_writer, read_stream = create_context_streams[SessionMessage | Exception](0)
+        read_stream_writer, read_stream = create_context_streams[SessionMessage | Exception](0, eof_is_half_close=True)
         write_stream, write_stream_reader = create_context_streams[SessionMessage](0)
 
         async def stdin_reader():
-            try:
-                async with read_stream_writer:
-                    async for line in stdin:
-                        try:
-                            message = types.jsonrpc_message_adapter.validate_json(line, by_name=False)
-                        except Exception as exc:
-                            await read_stream_writer.send(exc)
-                            continue
+            eof = anyio.Event()
 
-                        session_message = SessionMessage(message)
-                        await read_stream_writer.send(session_message)
-            except anyio.ClosedResourceError:  # pragma: no cover
-                await anyio.lowlevel.checkpoint()
+            async def deliver(line: str | None) -> None:
+                if line is None:
+                    eof.set()
+                    return
+                try:
+                    message = types.jsonrpc_message_adapter.validate_json(line, by_name=False)
+                except Exception as exc:
+                    await read_stream_writer.send(exc)
+                    return
+                await read_stream_writer.send(SessionMessage(message))
+
+            # A daemon thread of our own, not a pool thread: a pool thread parked in
+            # readline is joined at interpreter exit, so a client that closed our stdout
+            # but holds stdin open could pin the process. This one dies with it.
+            async with read_stream_writer, anyio.from_thread.BlockingPortal() as portal:
+
+                def read_lines() -> None:
+                    try:
+                        for line in stdin.wrapped:
+                            portal.call(deliver, line)
+                        portal.call(deliver, None)
+                    except (RuntimeError, concurrent.futures.CancelledError, anyio.BrokenResourceError):
+                        # The server stopped wanting stdin (portal stopped, or the read
+                        # stream torn down) while a read was still in flight.
+                        return
+
+                threading.Thread(target=read_lines, name="mcp stdio stdin reader", daemon=True).start()
+                await eof.wait()
 
         async def stdout_writer():
             try:
@@ -203,6 +233,11 @@ async def stdio_server(stdin: anyio.AsyncFile[str] | None = None, stdout: anyio.
                         json = session_message.message.model_dump_json(by_alias=True, exclude_unset=True)
                         await stdout.write(json + "\n")
                         await stdout.flush()
+            except BrokenPipeError:
+                # The client closed its end of our stdout: nobody reads our answers any
+                # more, whatever stdin says. A full disconnect, so stop everything now.
+                logger.info("client closed stdout; stopping the stdio server")
+                tg.cancel_scope.cancel()
             except anyio.ClosedResourceError:  # pragma: no cover
                 await anyio.lowlevel.checkpoint()
 

@@ -4,10 +4,12 @@ import os
 import sys
 import threading
 from collections.abc import AsyncIterator, Iterator
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from io import TextIOWrapper
+from typing import Any
 
 import anyio
+import anyio.lowlevel
 import anyio.to_thread
 import pytest
 from mcp_types import (
@@ -15,13 +17,21 @@ from mcp_types import (
     CLIENT_INFO_META_KEY,
     PROTOCOL_VERSION_META_KEY,
     SERVER_INFO_META_KEY,
+    CallToolRequestParams,
+    CallToolResult,
     JSONRPCMessage,
+    JSONRPCNotification,
     JSONRPCRequest,
     JSONRPCResponse,
+    ListToolsResult,
+    PaginatedRequestParams,
+    TextContent,
+    Tool,
     jsonrpc_message_adapter,
 )
 from typing_extensions import Buffer
 
+from mcp.server import Server, ServerRequestContext
 from mcp.server.mcpserver import MCPServer
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
@@ -692,3 +702,256 @@ def test_mcpserver_run_stdio_serves_a_modern_connection(monkeypatch: pytest.Monk
     # resultType is modern-only: proves the request was served at the discovered version.
     assert responses[1].result["tools"] == []
     assert responses[1].result["resultType"] == "complete"
+
+
+def _legacy_handshake() -> list[JSONRPCRequest | JSONRPCNotification]:
+    return [
+        JSONRPCRequest(
+            jsonrpc="2.0",
+            id=1,
+            method="initialize",
+            params={"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "eof", "version": "0"}},
+        ),
+        JSONRPCNotification(jsonrpc="2.0", method="notifications/initialized"),
+    ]
+
+
+async def _serve_process_stdio_to_eof(
+    monkeypatch: pytest.MonkeyPatch, server: MCPServer, frames: list[JSONRPCRequest | JSONRPCNotification]
+) -> list[JSONRPCMessage]:
+    """Serve `frames` over process stdio with EOF right behind the last one; return the response lines.
+
+    Unlike `_serve_stdio_and_collect`, nothing gates EOF on the responses: this is the
+    `python server.py < requests.jsonl` shape, where stdin ends before any handler has answered.
+    """
+    payload = "".join(f.model_dump_json(by_alias=True, exclude_none=True) + "\n" for f in frames).encode()
+    stdout = io.BytesIO()
+    # Kept referenced for the whole run: a collected wrapper would close the buffer under the server.
+    stdin_wrapper = TextIOWrapper(io.BytesIO(payload), encoding="utf-8")
+    stdout_wrapper = TextIOWrapper(stdout, encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", stdin_wrapper)
+    monkeypatch.setattr(sys, "stdout", stdout_wrapper)
+    with anyio.fail_after(5):
+        await server.run_stdio_async()
+    return [jsonrpc_message_adapter.validate_json(line) for line in stdout.getvalue().decode().splitlines()]
+
+
+@pytest.mark.parametrize("tool_body", ["def", "async def"])
+@pytest.mark.anyio
+async def test_stdio_server_answers_every_request_read_before_stdin_eof(
+    monkeypatch: pytest.MonkeyPatch, tool_body: str
+) -> None:
+    """Every request the server read before stdin EOF is answered before `run_stdio_async` returns.
+
+    Spec lifecycle: closing stdin is how the client shuts a stdio server down, and it keeps
+    reading stdout meanwhile. Regression lock for issue #2678, where EOF cancelled the calls
+    still in flight. Both tool bodies matter: a plain `def` runs on a worker thread and met the
+    cancel at its result write, an `async def` met it at its first checkpoint.
+    """
+    server = MCPServer(name="EchoStdio")
+    if tool_body == "def":
+
+        @server.tool(name="echo")
+        def echo_on_a_thread(text: str) -> str:
+            return text
+
+    else:
+
+        @server.tool(name="echo")
+        async def echo_on_the_loop(text: str) -> str:
+            await anyio.lowlevel.checkpoint()
+            return text
+
+    calls = [
+        JSONRPCRequest(
+            jsonrpc="2.0", id=3 + i, method="tools/call", params={"name": "echo", "arguments": {"text": f"call {i}"}}
+        )
+        for i in range(20)
+    ]
+    frames = [*_legacy_handshake(), JSONRPCRequest(jsonrpc="2.0", id=2, method="tools/list"), *calls]
+
+    responses = await _serve_process_stdio_to_eof(monkeypatch, server, frames)
+
+    answered: dict[int | str, JSONRPCResponse] = {}
+    for response in responses:
+        assert isinstance(response, JSONRPCResponse), response
+        answered[response.id] = response
+    assert sorted(answered, key=str) == sorted(range(1, 23), key=str)
+    for i, call in enumerate(calls):
+        assert answered[call.id].result["content"][0]["text"] == f"call {i}"
+
+
+@pytest.mark.anyio
+async def test_stdio_server_answers_requests_read_before_stdin_eof_on_a_modern_connection() -> None:
+    """The half-close also holds for a 2026-07-28 connection served the documented low-level way:
+    `stdio_server()` streams handed straight to `Server.run`, so no `MCPServer` wiring is involved."""
+    echo = Tool(name="echo", input_schema={"type": "object", "properties": {"text": {"type": "string"}}})
+
+    async def list_tools(
+        ctx: ServerRequestContext[dict[str, Any]], params: PaginatedRequestParams | None
+    ) -> ListToolsResult:
+        return ListToolsResult(tools=[echo])
+
+    async def call_tool(ctx: ServerRequestContext[dict[str, Any]], params: CallToolRequestParams) -> CallToolResult:
+        assert params.name == "echo"
+        await anyio.lowlevel.checkpoint()
+        return CallToolResult(content=[TextContent(type="text", text=(params.arguments or {})["text"])])
+
+    server: Server[dict[str, Any]] = Server("EchoLowLevel", on_list_tools=list_tools, on_call_tool=call_tool)
+
+    envelope = {
+        PROTOCOL_VERSION_META_KEY: "2026-07-28",
+        CLIENT_INFO_META_KEY: {"name": "eof", "version": "0"},
+        CLIENT_CAPABILITIES_META_KEY: {},
+    }
+    calls = [
+        JSONRPCRequest(
+            jsonrpc="2.0",
+            id=i,
+            method="tools/call",
+            params={"name": "echo", "arguments": {"text": f"call {i}"}, "_meta": envelope},
+        )
+        for i in range(1, 21)
+    ]
+    frames = [JSONRPCRequest(jsonrpc="2.0", id=21, method="tools/list", params={"_meta": envelope}), *calls]
+    stdin = io.StringIO("".join(f.model_dump_json(by_alias=True, exclude_none=True) + "\n" for f in frames))
+    stdout = io.StringIO()
+
+    with anyio.fail_after(5):
+        async with stdio_server(stdin=anyio.AsyncFile(stdin), stdout=anyio.AsyncFile(stdout)) as (read, write):
+            await server.run(read, write, server.create_initialization_options())
+
+    answered: dict[int | str, JSONRPCResponse] = {}
+    for line in stdout.getvalue().splitlines():
+        response = jsonrpc_message_adapter.validate_json(line)
+        assert isinstance(response, JSONRPCResponse), response
+        answered[response.id] = response
+    assert sorted(answered, key=str) == sorted(range(1, 22), key=str)
+    assert [t["name"] for t in answered[21].result["tools"]] == ["echo"]
+    for call in calls:
+        assert answered[call.id].result["content"][0]["text"] == f"call {call.id}"
+
+
+@contextmanager
+def _process_stdio_pipes(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[int, int]]:
+    """Point process stdio at real pipes; yield the client's ends (stdin writer, stdout reader).
+
+    Only a real pipe raises a broken pipe when its reader goes away, which is how a stdio
+    server learns its client stopped reading. The teardown closes whatever the test left open,
+    which is also what releases a reader thread still parked on stdin.
+    """
+    stdin_r, stdin_w = os.pipe()
+    stdout_r, stdout_w = os.pipe()
+    stdin_wrapper = TextIOWrapper(os.fdopen(stdin_r, "rb"), encoding="utf-8")
+    stdout_wrapper = TextIOWrapper(os.fdopen(stdout_w, "wb", buffering=0), encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", stdin_wrapper)
+    monkeypatch.setattr(sys, "stdout", stdout_wrapper)
+    try:
+        yield stdin_w, stdout_r
+    finally:
+        for fd in (stdin_w, stdout_r):
+            with suppress(OSError):
+                os.close(fd)
+        # Nothing was written through this wrapper's own buffer, so detach (no flush to a dead pipe).
+        stdout_wrapper.detach().close()
+        stdin_wrapper.close()
+
+
+def _stdin_reader_thread() -> threading.Thread | None:
+    return next((t for t in threading.enumerate() if t.name == "mcp stdio stdin reader"), None)
+
+
+@pytest.mark.anyio
+async def test_stdio_server_stops_at_once_when_the_client_closes_stdout_mid_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The drain is for a client that still reads. One that closes the server's stdout is gone, so the
+    server stops right away instead of finishing the requests it read, and `run_stdio_async` returns
+    normally: the client ending the session is not an error (SDK-defined).
+
+    Steps:
+    1. stdin carries the handshake and two calls, then EOF: the drain begins with both parked.
+    2. The client closes its end of stdout, then one call is released and writes its result.
+    3. That write finds no reader; the server stops, without waiting on the call still parked.
+    """
+    server = MCPServer(name="DrainStdio")
+    both_parked = anyio.Event()
+    release_first = anyio.Event()
+    parked = 0
+
+    @server.tool()
+    async def gated(finishes: bool) -> str:
+        nonlocal parked
+        parked += 1
+        if parked == 2:
+            both_parked.set()
+        if not finishes:
+            await anyio.sleep_forever()
+        await release_first.wait()
+        return "done"
+
+    frames = [
+        *_legacy_handshake(),
+        JSONRPCRequest(
+            jsonrpc="2.0", id=2, method="tools/call", params={"name": "gated", "arguments": {"finishes": True}}
+        ),
+        JSONRPCRequest(
+            jsonrpc="2.0", id=3, method="tools/call", params={"name": "gated", "arguments": {"finishes": False}}
+        ),
+    ]
+    payload = "".join(f.model_dump_json(by_alias=True, exclude_none=True) + "\n" for f in frames).encode()
+
+    async def client(stdin_w: int, stdout_r: int) -> None:
+        os.write(stdin_w, payload)
+        os.close(stdin_w)
+        await both_parked.wait()
+        os.close(stdout_r)
+        release_first.set()
+
+    with _process_stdio_pipes(monkeypatch) as (stdin_w, stdout_r):
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(client, stdin_w, stdout_r)
+                await server.run_stdio_async()
+    assert _stdin_reader_thread() is None
+
+
+@pytest.mark.anyio
+async def test_stdio_server_stops_at_once_when_the_client_closes_stdout_but_holds_stdin_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A client that closes the server's stdout while keeping stdin open still gets a prompt exit
+    (SDK-defined): the thread parked reading stdin cannot hold `run_stdio_async` open, and it ends
+    by itself once stdin does, so it cannot hold the process open either."""
+    server = MCPServer(name="OpenStdin")
+    parked = anyio.Event()
+    release = anyio.Event()
+
+    @server.tool()
+    async def gated() -> str:
+        parked.set()
+        await release.wait()
+        return "done"
+
+    frames = [
+        *_legacy_handshake(),
+        JSONRPCRequest(jsonrpc="2.0", id=2, method="tools/call", params={"name": "gated", "arguments": {}}),
+    ]
+    payload = "".join(f.model_dump_json(by_alias=True, exclude_none=True) + "\n" for f in frames).encode()
+
+    async def client(stdin_w: int, stdout_r: int) -> None:
+        os.write(stdin_w, payload)
+        await parked.wait()
+        os.close(stdout_r)
+        release.set()
+
+    with _process_stdio_pipes(monkeypatch) as (stdin_w, stdout_r):
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(client, stdin_w, stdout_r)
+                await server.run_stdio_async()
+        reader = _stdin_reader_thread()
+        assert reader is not None and reader.daemon
+        os.close(stdin_w)  # stdin ends only now; the parked reader wakes and finds the server gone
+        await anyio.to_thread.run_sync(reader.join, 5)
+    assert not reader.is_alive()

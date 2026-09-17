@@ -39,6 +39,8 @@ python server.py
 
 Nothing prints, and it doesn't return. It is waiting on stdin for a host to speak first.
 
+Closing that stdin is how a host stops the server. Requests it has already read are still answered: handlers in flight run to completion, their results go out on stdout, and only then does `run()` return. It also means `python server.py < requests.jsonl > responses.jsonl` answers every request in the file. How long to wait for that is the host's decision, not the server's: a host that has closed stdin and run out of patience kills the process, which is the shutdown sequence the spec describes. A host that closes the server's stdout instead has stopped reading, so the server stops at once, in-flight requests included.
+
 That also means stdout **is the wire**. While serving, the SDK moves the wire to a private descriptor and diverts output that is *flushed* to stdout (a subprocess writing to its inherited stdout, a flushed `print()`) to stderr, where it can't corrupt the stream. Output flushed to stdout *before* serving begins (a wrapper script echoing, an unbuffered import-time print) still lands on the wire, and so does a `print()` that stays buffered until the interpreter drains it at exit. For output you actually want, the `logging` module is the right tool: its handler flushes each record to stderr as it happens. That story is in **[Logging](../handlers/logging.md)**.
 
 ### Try it

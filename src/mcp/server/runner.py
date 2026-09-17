@@ -494,11 +494,22 @@ async def serve_loop(
         # next request (spec: SHOULD NOT, not MUST NOT) sees the initialized
         # state instead of failing the init-gate.
         inline_methods=frozenset({"initialize"}),
+        drain_on_eof=_eof_is_half_close(read_stream),
     )
     connection = Connection.for_loop(dispatcher, session_id=session_id)
     await serve_connection(
         server, dispatcher, connection=connection, lifespan_state=lifespan_state, init_options=init_options
     )
+
+
+def _eof_is_half_close(read_stream: ReadStream[Any]) -> bool:
+    """Whether the transport marked this read stream's EOF as a half-close.
+
+    Duck-typed like `_sender_context`: only the stdio transport's `ContextReceiveStream`
+    sets it, because closing the server's stdin is how a stdio client stops it
+    while it keeps reading the answers to what it already sent.
+    """
+    return bool(getattr(read_stream, "eof_is_half_close", False))
 
 
 def _has_modern_envelope(params: Mapping[str, Any] | None) -> bool:
@@ -623,6 +634,9 @@ async def serve_dual_era_loop(
     """
     # This loop owns both streams from the moment it is called, so the write
     # stream is closed even if the client leaves before sending any request.
+    # The replay stream is the SDK's own, so the transport's EOF semantics are
+    # read off the original stream here and handed down.
+    drain_on_eof = _eof_is_half_close(read_stream)
     try:
         async with _replay_from_opening_request(read_stream) as (opening, replayed):
             opens_modern = (
@@ -630,7 +644,12 @@ async def serve_dual_era_loop(
             )
             if opens_modern:
                 await _serve_modern_stream(
-                    server, replayed, write_stream, lifespan_state=lifespan_state, raise_exceptions=raise_exceptions
+                    server,
+                    replayed,
+                    write_stream,
+                    lifespan_state=lifespan_state,
+                    raise_exceptions=raise_exceptions,
+                    drain_on_eof=drain_on_eof,
                 )
             else:
                 await _serve_legacy_stream(
@@ -641,6 +660,7 @@ async def serve_dual_era_loop(
                     session_id=session_id,
                     init_options=init_options,
                     raise_exceptions=raise_exceptions,
+                    drain_on_eof=drain_on_eof,
                 )
     finally:
         await write_stream.aclose()
@@ -723,6 +743,7 @@ async def _serve_legacy_stream(
     session_id: str | None,
     init_options: InitializationOptions | None,
     raise_exceptions: bool,
+    drain_on_eof: bool,
 ) -> None:
     """Serve a 2025 handshake connection; enveloped requests are refused."""
     dispatcher: JSONRPCDispatcher[TransportContext] = JSONRPCDispatcher(
@@ -731,6 +752,7 @@ async def _serve_legacy_stream(
         raise_handler_exceptions=raise_exceptions,
         # `initialize` inline for the same pipelining reason as `serve_loop`.
         inline_methods=frozenset({"initialize"}),
+        drain_on_eof=drain_on_eof,
     )
     connection = Connection.for_loop(dispatcher, session_id=session_id)
     runner = ServerRunner(server, connection, lifespan_state, init_options=init_options)
@@ -759,10 +781,11 @@ async def _serve_modern_stream(
     *,
     lifespan_state: LifespanT,
     raise_exceptions: bool,
+    drain_on_eof: bool,
 ) -> None:
     """Serve a 2026-07-28 connection: every request carries its own envelope."""
     dispatcher: JSONRPCDispatcher[TransportContext] = JSONRPCDispatcher(
-        read_stream, write_stream, raise_handler_exceptions=raise_exceptions
+        read_stream, write_stream, raise_handler_exceptions=raise_exceptions, drain_on_eof=drain_on_eof
     )
     outbound = NotifyOnlyOutbound(dispatcher)
 

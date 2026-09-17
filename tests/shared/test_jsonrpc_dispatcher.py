@@ -333,8 +333,8 @@ async def test_run_returns_cleanly_when_read_stream_receive_end_is_closed():
 
 @pytest.mark.anyio
 async def test_run_cancels_in_flight_handlers_when_read_stream_eofs():
-    """run() cancels still-running handlers at read-stream EOF; otherwise its join waits forever
-    (over SSE, leaking the handler and the GET request hosting the session)."""
+    """Without `drain_on_eof`, run() cancels still-running handlers at read-stream EOF; otherwise
+    its join waits forever (over SSE, leaking the handler and the GET request hosting the session)."""
     c2s_send, c2s_recv = anyio.create_memory_object_stream[SessionMessage | Exception](32)
     s2c_send, s2c_recv = anyio.create_memory_object_stream[SessionMessage | Exception](32)
     server: JSONRPCDispatcher[TransportContext] = JSONRPCDispatcher(c2s_recv, s2c_send)
@@ -2514,3 +2514,194 @@ async def test_send_raw_request_with_caller_supplied_string_id_is_verbatim_on_th
         for stream in (c2s_send, c2s_recv, s2c_send, s2c_recv):
             stream.close()
     assert result_box == [{"ok": True}]
+
+
+async def _peer_ping_until_eof(ctx: DCtx) -> None:
+    """Park on a request to the peer until read-stream EOF wakes it with CONNECTION_CLOSED.
+
+    A barrier for the drain tests: once this returns, run() has processed EOF, so whatever the
+    handler does next provably happens during the drain and not before it.
+    """
+    with pytest.raises(MCPError) as exc:
+        await ctx.send_raw_request("peer/ping", None)
+    assert exc.value.error.code == CONNECTION_CLOSED
+
+
+@pytest.mark.anyio
+async def test_eof_drain_answers_every_request_read_before_read_stream_eof():
+    """With `drain_on_eof`, a clean read-stream EOF is a half-close: handlers already running are
+    not cancelled, and their results land even when queued behind the writer, however long they take.
+    SDK-defined, for stdio (issue #2678): the client closes stdin, then drains stdout.
+
+    Steps:
+    1. Three requests arrive; each handler parks on a request to the peer.
+    2. The read side EOFs: the fan-out wakes all three with CONNECTION_CLOSED.
+    3. Each returns a result onto the zero-buffer write stream, which nobody reads yet.
+    4. The results are read one by one, and run() returns only after the last.
+    """
+    c2s_send, c2s_recv = anyio.create_memory_object_stream[SessionMessage | Exception](0)
+    # Zero-buffer write side, as the stdio transport wires it: finished results queue behind the reader.
+    s2c_send, s2c_recv = anyio.create_memory_object_stream[SessionMessage | Exception](0)
+    server: JSONRPCDispatcher[TransportContext] = JSONRPCDispatcher(c2s_recv, s2c_send, drain_on_eof=True)
+
+    async def on_request(ctx: DCtx, method: str, params: Mapping[str, Any] | None) -> dict[str, Any]:
+        assert method == "work"
+        await _peer_ping_until_eof(ctx)
+        return {"done": ctx.request_id}
+
+    async def on_notify(ctx: DCtx, method: str, params: Mapping[str, Any] | None) -> None:
+        raise NotImplementedError
+
+    run_returned = anyio.Event()
+
+    async def drive() -> None:
+        await server.run(on_request, on_notify)
+        run_returned.set()
+
+    answers: list[JSONRPCMessage] = []
+    try:
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(drive)
+                for request_id in (1, 2, 3):
+                    await c2s_send.send(
+                        SessionMessage(message=JSONRPCRequest(jsonrpc="2.0", id=request_id, method="work", params=None))
+                    )
+                pings: list[JSONRPCMessage] = []
+                for _ in range(3):
+                    ping = await s2c_recv.receive()
+                    assert isinstance(ping, SessionMessage)
+                    pings.append(ping.message)
+                assert all(isinstance(p, JSONRPCRequest) and p.method == "peer/ping" for p in pings)
+                c2s_send.close()
+                for _ in range(3):
+                    answer = await s2c_recv.receive()
+                    assert isinstance(answer, SessionMessage)
+                    answers.append(answer.message)
+                await run_returned.wait()
+        assert sorted(answers, key=lambda m: str(getattr(m, "id", ""))) == [
+            JSONRPCResponse(jsonrpc="2.0", id=1, result={"done": 1}),
+            JSONRPCResponse(jsonrpc="2.0", id=2, result={"done": 2}),
+            JSONRPCResponse(jsonrpc="2.0", id=3, result={"done": 3}),
+        ]
+    finally:
+        for s in (c2s_send, c2s_recv, s2c_send, s2c_recv):
+            s.close()
+
+
+@pytest.mark.anyio
+async def test_eof_drain_delivers_notifications_from_in_flight_handlers():
+    """During the drain the peer still reads, so a draining handler's notifications reach the wire
+    ahead of its result (SDK-defined); only after run() returns is notify() dropped."""
+    c2s_send, c2s_recv = anyio.create_memory_object_stream[SessionMessage | Exception](4)
+    s2c_send, s2c_recv = anyio.create_memory_object_stream[SessionMessage | Exception](4)
+    server: JSONRPCDispatcher[TransportContext] = JSONRPCDispatcher(c2s_recv, s2c_send, drain_on_eof=True)
+
+    async def on_request(ctx: DCtx, method: str, params: Mapping[str, Any] | None) -> dict[str, Any]:
+        assert method == "work"
+        await _peer_ping_until_eof(ctx)
+        await ctx.notify("notifications/message", {"level": "info", "data": "still working"})
+        return {"ok": True}
+
+    async def on_notify(ctx: DCtx, method: str, params: Mapping[str, Any] | None) -> None:
+        raise NotImplementedError
+
+    wire: list[SessionMessage | Exception] = []
+    try:
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as tg:
+                await tg.start(server.run, on_request, on_notify)
+                await c2s_send.send(
+                    SessionMessage(message=JSONRPCRequest(jsonrpc="2.0", id=1, method="work", params=None))
+                )
+                ping = await s2c_recv.receive()
+                assert isinstance(ping, SessionMessage) and isinstance(ping.message, JSONRPCRequest)
+                c2s_send.close()
+                wire.extend([await s2c_recv.receive(), await s2c_recv.receive()])
+        assert [m.message for m in wire if isinstance(m, SessionMessage)] == [
+            JSONRPCNotification(
+                jsonrpc="2.0", method="notifications/message", params={"level": "info", "data": "still working"}
+            ),
+            JSONRPCResponse(jsonrpc="2.0", id=1, result={"ok": True}),
+        ]
+    finally:
+        for s in (c2s_send, c2s_recv, s2c_send, s2c_recv):
+            s.close()
+
+
+@pytest.mark.anyio
+async def test_eof_drain_fails_a_new_request_to_the_peer_at_once():
+    """A draining handler that asks the peer something new gets CONNECTION_CLOSED immediately: the
+    read side is gone, so nothing could ever answer, and the drain must not hang on it."""
+    c2s_send, c2s_recv = anyio.create_memory_object_stream[SessionMessage | Exception](4)
+    s2c_send, s2c_recv = anyio.create_memory_object_stream[SessionMessage | Exception](4)
+    server: JSONRPCDispatcher[TransportContext] = JSONRPCDispatcher(c2s_recv, s2c_send, drain_on_eof=True)
+
+    async def on_request(ctx: DCtx, method: str, params: Mapping[str, Any] | None) -> dict[str, Any]:
+        assert method == "work"
+        await _peer_ping_until_eof(ctx)
+        with pytest.raises(MCPError) as exc:
+            await ctx.send_raw_request("sampling/createMessage", None)
+        return {"code": exc.value.error.code}
+
+    async def on_notify(ctx: DCtx, method: str, params: Mapping[str, Any] | None) -> None:
+        raise NotImplementedError
+
+    wire: list[SessionMessage | Exception] = []
+    try:
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as tg:
+                await tg.start(server.run, on_request, on_notify)
+                await c2s_send.send(
+                    SessionMessage(message=JSONRPCRequest(jsonrpc="2.0", id=1, method="work", params=None))
+                )
+                ping = await s2c_recv.receive()
+                assert isinstance(ping, SessionMessage) and isinstance(ping.message, JSONRPCRequest)
+                c2s_send.close()
+                wire.append(await s2c_recv.receive())
+        assert [m.message for m in wire if isinstance(m, SessionMessage)] == [
+            JSONRPCResponse(jsonrpc="2.0", id=1, result={"code": CONNECTION_CLOSED})
+        ]
+        # The second request never reached the wire: EOF closed the dispatcher for requests.
+        with pytest.raises(anyio.EndOfStream):
+            s2c_recv.receive_nowait()
+    finally:
+        for s in (c2s_send, c2s_recv, s2c_send, s2c_recv):
+            s.close()
+
+
+@pytest.mark.anyio
+async def test_eof_drain_does_not_apply_when_run_is_cancelled():
+    """Cancelling run() still cancels in-flight handlers at once, `drain_on_eof` or not: the drain
+    is for a peer that half-closed, and a cancelled loop has no peer to answer."""
+    c2s_send, c2s_recv = anyio.create_memory_object_stream[SessionMessage | Exception](4)
+    s2c_send, s2c_recv = anyio.create_memory_object_stream[SessionMessage | Exception](4)
+    server: JSONRPCDispatcher[TransportContext] = JSONRPCDispatcher(c2s_recv, s2c_send, drain_on_eof=True)
+    handler_started = anyio.Event()
+    handler_cancelled = anyio.Event()
+
+    async def park(ctx: DCtx, method: str, params: Mapping[str, Any] | None) -> dict[str, Any]:
+        handler_started.set()
+        try:
+            await anyio.sleep_forever()
+        finally:
+            handler_cancelled.set()
+        raise NotImplementedError
+
+    async def on_notify(ctx: DCtx, method: str, params: Mapping[str, Any] | None) -> None:
+        raise NotImplementedError
+
+    try:
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as tg:
+                await tg.start(server.run, park, on_notify)
+                await c2s_send.send(
+                    SessionMessage(message=JSONRPCRequest(jsonrpc="2.0", id=1, method="t", params=None))
+                )
+                await handler_started.wait()
+                tg.cancel_scope.cancel()
+        assert handler_cancelled.is_set()
+    finally:
+        await resync_tracer()
+        for s in (c2s_send, c2s_recv, s2c_send, s2c_recv):
+            s.close()
